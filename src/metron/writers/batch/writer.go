@@ -5,16 +5,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/cloudfoundry/dropsonde/emitter"
-	"github.com/cloudfoundry/dropsonde/envelope_extensions"
 	"github.com/cloudfoundry/dropsonde/metricbatcher"
 	"github.com/cloudfoundry/dropsonde/metrics"
 	"github.com/cloudfoundry/gosteno"
-	"github.com/cloudfoundry/sonde-go/events"
-	"github.com/gogo/protobuf/proto"
 )
 
 const (
@@ -57,20 +52,26 @@ type BatchChainByteWriter interface {
 	Write(message []byte, chainers ...metricbatcher.BatchCounterChainer) (sentLength int, err error)
 }
 
-type Writer struct {
-	flushDuration   time.Duration
-	outWriter       BatchChainByteWriter
-	writerLock      sync.Mutex
-	msgBuffer       *messageBuffer
-	msgBufferLock   sync.Mutex
-	timer           *time.Timer
-	logger          *gosteno.Logger
-	droppedMessages uint64
-	chainers        []metricbatcher.BatchCounterChainer
-	protocol        string
+//go:generate hel --type DroppedMessageCounter --output mock_dropped_message_counter_test.go
+
+type DroppedMessageCounter interface {
+	Drop(count uint32)
 }
 
-func NewWriter(protocol string, writer BatchChainByteWriter, bufferCapacity uint64, flushDuration time.Duration, logger *gosteno.Logger) (*Writer, error) {
+type Writer struct {
+	flushDuration  time.Duration
+	outWriter      BatchChainByteWriter
+	writerLock     sync.Mutex
+	msgBuffer      *messageBuffer
+	msgBufferLock  sync.Mutex
+	timer          *time.Timer
+	logger         *gosteno.Logger
+	droppedCounter DroppedMessageCounter
+	chainers       []metricbatcher.BatchCounterChainer
+	protocol       string
+}
+
+func NewWriter(protocol string, writer BatchChainByteWriter, droppedCounter DroppedMessageCounter, bufferCapacity uint64, flushDuration time.Duration, logger *gosteno.Logger) (*Writer, error) {
 	if bufferCapacity < minBufferCapacity {
 		return nil, fmt.Errorf("batch.Writer requires a buffer of at least %d bytes", minBufferCapacity)
 	}
@@ -81,12 +82,13 @@ func NewWriter(protocol string, writer BatchChainByteWriter, bufferCapacity uint
 	batchTimer := time.NewTimer(time.Second)
 	batchTimer.Stop()
 	batchWriter := &Writer{
-		flushDuration: flushDuration,
-		outWriter:     writer,
-		msgBuffer:     newMessageBuffer(make([]byte, 0, bufferCapacity)),
-		timer:         batchTimer,
-		logger:        logger,
-		protocol:      protocol,
+		flushDuration:  flushDuration,
+		outWriter:      writer,
+		droppedCounter: droppedCounter,
+		msgBuffer:      newMessageBuffer(make([]byte, 0, bufferCapacity)),
+		timer:          batchTimer,
+		logger:         logger,
+		protocol:       protocol,
 	}
 	go batchWriter.flushOnTimer()
 	return batchWriter, nil
@@ -98,22 +100,14 @@ func (w *Writer) Write(msgBytes []byte, chainers ...metricbatcher.BatchCounterCh
 
 	w.chainers = append(w.chainers, chainers...)
 
-	prefixedBytes, err := w.prefixMessage(msgBytes)
-	if err != nil {
-		w.logger.Errorf("Error encoding message length: %v\n", err)
-		metrics.BatchIncrementCounter("tls.sendErrorCount")
-		return 0, err
-	}
+	prefixedBytes := prefixMessage(msgBytes)
 	switch {
 	case w.msgBuffer.Len()+len(prefixedBytes) > w.msgBuffer.Cap():
 		_, err := w.retryWrites(prefixedBytes)
 		if err != nil {
 			dropped := w.msgBuffer.messages + 1
-			atomic.AddUint64(&w.droppedMessages, dropped)
-			metrics.BatchAddCounter("MessageBuffer.droppedMessageCount", dropped)
+			w.droppedCounter.Drop(uint32(dropped))
 			w.msgBuffer.Reset()
-
-			w.msgBuffer.writeNonMessage(w.droppedLogMessage())
 			w.timer.Reset(w.flushDuration)
 			return 0, err
 		}
@@ -131,16 +125,6 @@ func (w *Writer) Stop() {
 	w.msgBufferLock.Lock()
 	defer w.msgBufferLock.Unlock()
 	w.timer.Stop()
-}
-
-func (w *Writer) prefixMessage(msgBytes []byte) ([]byte, error) {
-	buffer := bytes.NewBuffer(make([]byte, 0, len(msgBytes)*2))
-	err := binary.Write(buffer, binary.LittleEndian, uint32(len(msgBytes)))
-	if err != nil {
-		return nil, err
-	}
-	_, err = buffer.Write(msgBytes)
-	return buffer.Bytes(), err
 }
 
 func (w *Writer) flushWrite(bytes []byte) (int, error) {
@@ -163,7 +147,6 @@ func (w *Writer) flushWrite(bytes []byte) (int, error) {
 
 	metrics.BatchAddCounter("DopplerForwarder.sentMessages", bufferMessageCount)
 	metrics.BatchAddCounter(w.protocol+".sentMessageCount", bufferMessageCount)
-	atomic.StoreUint64(&w.droppedMessages, 0)
 	w.msgBuffer.Reset()
 	w.chainers = nil
 	return sent, nil
@@ -200,26 +183,12 @@ func (w *Writer) retryWrites(message []byte) (sent int, err error) {
 	return 0, err
 }
 
-func (w *Writer) droppedLogMessage() []byte {
-	droppedMessages := atomic.LoadUint64(&w.droppedMessages)
-	logMessage := &events.LogMessage{
-		Message:     []byte(fmt.Sprintf("Dropped %d message(s) from MetronAgent to Doppler", droppedMessages)),
-		MessageType: events.LogMessage_ERR.Enum(),
-		AppId:       proto.String(envelope_extensions.SystemAppId),
-		Timestamp:   proto.Int64(time.Now().UnixNano()),
-	}
-	env, err := emitter.Wrap(logMessage, "MetronAgent")
+func prefixMessage(msgBytes []byte) []byte {
+	buffer := bytes.NewBuffer(make([]byte, 0, len(msgBytes)*2))
+	err := binary.Write(buffer, binary.LittleEndian, uint32(len(msgBytes)))
 	if err != nil {
-		w.logger.Fatalf("Failed to emitter.Wrap a log message: %s", err)
+		panic(err)
 	}
-	marshaled, err := proto.Marshal(env)
-	if err != nil {
-		w.logger.Fatalf("Failed to marshal generated dropped log message: %s", err)
-	}
-	prefixedBytes, err := w.prefixMessage(marshaled)
-	if err != nil {
-		w.logger.Fatalf("Failed to prefix dropped log message: %s", err)
-	}
-
-	return prefixedBytes
+	_, err = buffer.Write(msgBytes)
+	return buffer.Bytes()
 }
